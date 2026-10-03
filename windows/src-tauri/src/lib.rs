@@ -1,6 +1,7 @@
 // Coucou for Windows — app wiring and the commands the island calls.
 
 mod claude;
+mod codex;
 mod files;
 mod hooks;
 mod integrations;
@@ -60,7 +61,12 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+async fn save_settings(app: AppHandle, shared: State<'_, Shared>, chat: State<'_, Chat>, codex: State<'_, codex::Codex>, settings: Settings) -> Result<(), String> {
+    let provider_changed = shared.settings.lock().unwrap().chat_provider != settings.chat_provider;
+    if provider_changed {
+        codex.reset().await;
+        chat.reset();
+    }
     let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
@@ -84,6 +90,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
+    Ok(())
 }
 
 /// Hidden island → shrink the window to the invisible wake strip and park the
@@ -236,18 +243,46 @@ fn approval_decline(app: AppHandle, request_id: String) {
 /// One chat turn. The API key and any file bytes stay on the Rust side.
 #[tauri::command]
 async fn chat_send(
+    app: AppHandle,
+    codex: State<'_, codex::Codex>,
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let settings = shared.settings.lock().unwrap().clone();
+    match settings.chat_provider {
+        settings::ChatProvider::Chatgpt => codex.send(&app, query, context).await,
+        settings::ChatProvider::Anthropic => claude::send(&chat, &settings.model, query, context).await,
+    }
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<Chat>) {
+async fn chat_reset(chat: State<'_, Chat>, codex: State<'_, codex::Codex>) -> Result<(), String> {
     chat.reset();
+    codex.reset().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn chatgpt_status(app: AppHandle, codex: State<'_, codex::Codex>) -> Result<codex::AccountStatus, String> {
+    codex.status(&app).await
+}
+#[tauri::command]
+async fn chatgpt_connect(app: AppHandle, shared: State<'_, Shared>, codex: State<'_, codex::Codex>) -> Result<(), String> {
+    let result = codex.connect(&app).await;
+    if result.is_ok() && shared.settings.lock().unwrap().chat_provider == settings::ChatProvider::Chatgpt {
+        let _ = app.emit("chat-cleared", ());
+    }
+    result
+}
+#[tauri::command]
+async fn chatgpt_disconnect(app: AppHandle, shared: State<'_, Shared>, codex: State<'_, codex::Codex>) -> Result<(), String> {
+    codex.disconnect(&app).await?;
+    if shared.settings.lock().unwrap().chat_provider == settings::ChatProvider::Chatgpt {
+        let _ = app.emit("chat-cleared", ());
+    }
+    Ok(())
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -374,6 +409,7 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(codex::Codex::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -393,6 +429,9 @@ pub fn run() {
             log_line,
             chat_send,
             chat_reset,
+            chatgpt_status,
+            chatgpt_connect,
+            chatgpt_disconnect,
             ingest_file,
             secret_present,
             secret_set,

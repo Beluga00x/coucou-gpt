@@ -46,7 +46,8 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     spellcheck: "false",
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
-  const bar = h("div", { class: "chat-bar" }, input, send);
+  const reset = h("button", { class: "send-btn", title: "New chat", "aria-label": "New chat", text: "+" });
+  const bar = h("div", { class: "chat-bar" }, reset, input, send);
 
   const el = h(
     "div",
@@ -63,6 +64,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     if (!query || sending) return;
     input.value = "";
     sending = true;
+    const provider = State.settings.chatProvider;
     Sound.play("send");
 
     State.chatHistory.push({ id: nextId++, role: "user", content: query });
@@ -76,10 +78,14 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
     try {
       const reply = await Bridge.chatSend(query, context);
+      if (State.settings.chatProvider !== provider) return;
       State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
       State.stateOverride = null;
       Sound.play("finish");
     } catch (err) {
+      if (State.settings.chatProvider !== provider) return;
+      State.chatHistory.pop(); // failed turns are not part of backend history
+      input.value = query;
       State.stateOverride = null;
       State.noteMessage = String(err).replace(/^Error:\s*/, "");
       State.view = "note";
@@ -92,6 +98,24 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     }
   }
 
+  reset.addEventListener("click", async () => {
+    if (sending) return;
+    reset.disabled = true;
+    try {
+      await Bridge.chatReset();
+      State.chatHistory = [];
+      State.droppedFile = null;
+      State.promptContext = null;
+      State.stateOverride = null;
+      input.value = "";
+      State.notify();
+      onHeightChange();
+    } catch (err) {
+      State.noteMessage = String(err);
+      State.view = "note";
+      State.notify();
+    } finally { reset.disabled = false; }
+  });
   send.addEventListener("click", () => void submit());
   input.addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") {
@@ -124,6 +148,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
       input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
       input.disabled = sending;
+      reset.disabled = sending;
     },
     focus() {
       input.focus();

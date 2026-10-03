@@ -4,6 +4,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatProvider { #[default] Anthropic, Chatgpt }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -20,6 +24,26 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default)]
+    pub chat_provider: ChatProvider,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_settings_keep_anthropic_and_new_provider_round_trips() {
+        let old = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(old["chatProvider"], "anthropic");
+        let mut legacy = old.clone();
+        legacy.as_object_mut().unwrap().remove("chatProvider");
+        let decoded: Settings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()["chatProvider"], "anthropic");
+        let mut updated = old;
+        updated["chatProvider"] = serde_json::json!("chatgpt");
+        let decoded: Settings = serde_json::from_value(updated).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()["chatProvider"], "chatgpt");
+    }
 }
 
 fn default_model() -> String {
@@ -43,6 +67,7 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            chat_provider: ChatProvider::Anthropic,
         }
     }
 }

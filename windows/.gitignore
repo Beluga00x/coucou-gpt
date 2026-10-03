@@ -1,4 +1,8 @@
 node_modules/
+# Staged from pinned npm Codex package during prebuild
+src-tauri/resources/codex/
+.codex-test-*/
+.codex-turn-test-*/
 dist/
 target/
 release/

@@ -53,8 +53,20 @@ async function main() {
 
   await onEvent<null>("screen-changed", () => void Bridge.reposition());
 
+  await onEvent<null>("chat-cleared", () => {
+    State.chatHistory = [];
+    State.stateOverride = null;
+    State.notify();
+  });
+
   // The settings window writes preferences; apply them here without a restart.
   await onEvent<Settings>("settings-changed", (s) => {
+    if (s.chatProvider !== State.settings.chatProvider) {
+      State.chatHistory = [];
+      State.droppedFile = null;
+      State.promptContext = null;
+      State.stateOverride = null;
+    }
     State.settings = { ...State.settings, ...s };
     island.applySettings();
     State.loadIntegrationTasks();

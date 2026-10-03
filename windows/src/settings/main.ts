@@ -171,6 +171,60 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
+// ── Chat provider / official ChatGPT account ──────────────────────────────────
+function chatProviderSection(): HTMLElement {
+  const select = h("select", {}) as HTMLSelectElement;
+  select.append(h("option", { value: "anthropic", text: "Anthropic (API key)" }),
+    h("option", { value: "chatgpt", text: "ChatGPT account (Codex)" }));
+  select.value = settings.chatProvider;
+  const status = h("div", { class: "hint", text: "Click Check status to check your ChatGPT connection." });
+  const connect = h("button", { class: "primary", text: "Connect ChatGPT" });
+  const check = h("button", { text: "Check status" });
+  const disconnect = h("button", { class: "danger", text: "Disconnect / cancel login" });
+  let timer: number | undefined;
+  let busy = false;
+  function stopPolling() { window.clearTimeout(timer); timer = undefined; }
+  async function refresh() {
+    const result = await Bridge.chatgptStatus();
+    status.textContent = result.message;
+    connect.textContent = result.connected ? "Reconnect ChatGPT" : "Connect ChatGPT";
+    stopPolling();
+    if (result.pending) timer = window.setTimeout(() => void perform(refresh), 2000);
+  }
+  async function perform(action: () => Promise<unknown>) {
+    if (busy) return;
+    busy = true;
+    connect.disabled = check.disabled = disconnect.disabled = true;
+    try { await action(); }
+    catch (err) { stopPolling(); status.textContent = String(err).replace(/^Error:\s*/, ""); }
+    finally { busy = false; connect.disabled = check.disabled = disconnect.disabled = false; }
+  }
+  select.addEventListener("change", () => {
+    settings.chatProvider = select.value as Settings["chatProvider"];
+    void save();
+  });
+  connect.addEventListener("click", () => void perform(async () => {
+    stopPolling();
+    status.textContent = "Opening the official OpenAI sign-in page…";
+    await Bridge.chatgptConnect();
+    await refresh();
+  }));
+  check.addEventListener("click", () => void perform(refresh));
+  disconnect.addEventListener("click", () => void perform(async () => {
+    stopPolling();
+    await Bridge.chatgptDisconnect();
+    await refresh();
+  }));
+  window.addEventListener("beforeunload", stopPolling);
+  // Reading status does not initiate login or contact an existing personal CLI.
+  void perform(refresh);
+  return h("section", {}, h("h2", { text: "Chat provider" }),
+    h("div", { class: "row" }, h("label", { text: "Use" }), select),
+    h("div", { class: "hint", text: "Changing providers starts a new conversation. ChatGPT uses your account's Codex access and limits, not an API key. This is not ChatGPT web history." }),
+    h("div", { class: "row" }, connect, check, disconnect), status,
+    h("div", { class: "hint", text: "Sign in only in your browser. Codex stores credentials in Windows Credential Manager under a separate Coucou profile. Text-only: no file access, browsing, shell commands or local tools. Model is chosen by Codex. Keep Coucou running while signing in." }));
+}
+
 // ── Claude API section ────────────────────────────────────────────────────────
 
 const MODELS: [string, string][] = [
@@ -181,7 +235,7 @@ const MODELS: [string, string][] = [
 
 function apiSection(hasKey: boolean): HTMLElement {
   const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No key yet — the chat needs one." });
+  const state = h("span", { class: "hint", text: hasKey ? "Key saved in the Windows Credential Manager." : "No Anthropic key — only needed when Anthropic is selected." });
 
   const field = h("input", {
     type: "password",
@@ -200,7 +254,7 @@ function apiSection(hasKey: boolean): HTMLElement {
     dot.style.background = present ? "#22c55e" : "#f4505e";
     state.textContent = present
       ? "Key saved in the Windows Credential Manager."
-      : "No key yet — the chat needs one.";
+      : "No Anthropic key — only needed when Anthropic is selected.";
     field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
     clearBtn.style.display = present ? "" : "none";
   }
@@ -442,6 +496,7 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
+    chatProviderSection(),
     apiSection(hasKey),
     integrationsSection(present),
     generalSection(),

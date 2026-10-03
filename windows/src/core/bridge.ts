@@ -84,7 +84,10 @@ export const Bridge = {
   /** One chat turn. The API key and any file bytes never leave Rust. */
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
-  chatReset: () => call<void>("chat_reset"),
+  chatReset: () => callOrThrow<void>("chat_reset"),
+  chatgptStatus: () => callOrThrow<{ connected: boolean; pending: boolean; message: string }>("chatgpt_status"),
+  chatgptConnect: () => callOrThrow<void>("chatgpt_connect"),
+  chatgptDisconnect: () => callOrThrow<void>("chatgpt_disconnect"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
