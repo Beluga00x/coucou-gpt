@@ -406,8 +406,8 @@ impl Codex {
         &self,
         app: &AppHandle,
         query: String,
-        context: Option<crate::claude::ChatContext>,
-    ) -> Result<crate::claude::ChatReply, String> {
+        context: Option<crate::chat::ChatContext>,
+    ) -> Result<crate::chat::ChatReply, String> {
         if context.is_some() {
             return Err("ChatGPT mode is text-only: remove the attachment/start a new chat, or select Anthropic for file chat.".into());
         }
@@ -455,7 +455,7 @@ impl Codex {
             Ok(text) => {
                 c.history.push(json!({"role":"user","content":query}));
                 c.history.push(json!({"role":"assistant","content":text}));
-                Ok(crate::claude::ChatReply { text })
+                Ok(crate::chat::ChatReply { text })
             }
             Err(e) => {
                 c.stop();

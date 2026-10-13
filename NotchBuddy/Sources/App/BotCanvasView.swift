@@ -1,22 +1,32 @@
 import SwiftUI
+import AppKit
 
 /// SwiftUI wrapper: TimelineView drives a Canvas that calls BotEngine.draw().
 /// Uses a shared engine per-task; the main bot uses AppState's shared engine.
 struct BotCanvasView: View {
     @ObservedObject var state: AppState
     var particleOverhang: CGFloat = 0
+    /// When set, overrides island-based eye-tracking (used by desktop Mochi).
+    /// CGPoint in the same coord space as state.mousePosition (DesktopSpace, y-down).
+    var lookOriginOverride: CGPoint? = nil
+    /// Not drawn while true (e.g. the notch copy while Mochi is on the desktop).
+    var paused: Bool = false
 
     // One engine per view instance (main bot)
     @StateObject private var engine = BotEngine()
 
     var body: some View {
-        TimelineView(.animation(paused: state.mode == .hidden)) { timeline in
+        // Display refresh rate — every frame on a 60 Hz screen, every frame on ProMotion.
+        // MochiFrameClock.advance accumulates the step debt so Mochi's speed never changes.
+        TimelineView(.animation(paused: state.mode == .hidden || paused)) { timeline in
+            // The Canvas must capture the frame's date: a closure that doesn't change from
+            // one tick to the next is not redrawn, and Mochi froze.
+            let frame = timeline.date
             Canvas { context, size in
-                let now = timeline.date.timeIntervalSinceReferenceDate
-                let dtRaw = min(0.05, now - engine.lastTime)
-                let dt = dtRaw
-                engine.lookX = lookX(state: state, size: size)
-                engine.lookY = lookY(state: state, size: size)
+                _ = frame
+                let look = lookXY(state: state)
+                engine.lookX = look.x
+                engine.lookY = look.y
                 engine.particleOverhang = particleOverhang
                 // Widen slot when file is hovering over the mailbox (morph > 0.5)
                 // Open mouth (hover=0.20R) when file dragged over box; close when not
@@ -30,7 +40,9 @@ struct BotCanvasView: View {
                 // Claude Code tasks use state-based gradient (working=blue, thinking=purple, etc.).
                 #if !APPSTORE
                 if state.showingPlanDetail {
-                    let hex = ClaudePlanGauge.color(for: state.claudePlanUsage.flatMap { ClaudePlanGauge.dominantPct($0) })
+                    let hex = state.planDetailIsCodex
+                        ? CodexPlanGauge.color(state.codexPlanUsage)
+                        : ClaudePlanGauge.color(for: state.claudePlanUsage.flatMap { ClaudePlanGauge.dominantPct($0) })
                     engine.bodyColor = cgColorFromHex(hex)
                 } else {
                     engine.bodyColor = (state.focusTask?.isIntegration == true)
@@ -46,30 +58,79 @@ struct BotCanvasView: View {
                 // Compute shouldDance per-frame (no observer lag)
                 let dancing: Bool = {
                     #if !APPSTORE
-                    guard AppState.shared.musicPlaying else { return false }
-                    guard AppState.shared.activeIntegrations.contains("integration_music") else { return false }
+                    let active = AppState.shared.activeIntegrations
+                    let music = AppState.shared.musicPlaying && active.contains("integration_music")
+                    let spotify = SpotifyController.shared.isPlaying && active.contains(SpotifyController.pillId)
+                    guard music || spotify else { return false }
                     let allowed: Set<BotState> = [.idle, .working, .thinking, .searching, .finished]
                     guard allowed.contains(state.effectiveState) else { return false }
                     if state.mode == .compact { return true }
-                    return state.mode == .expanded && state.view == .overview && state.focusId == "integration_music"
+                    guard state.mode == .expanded && state.view == .overview else { return false }
+                    return (music && state.focusId == "integration_music")
+                        || (spotify && state.focusId == SpotifyController.pillId)
                     #else
                     return false
                     #endif
                 }()
                 engine.setDancing(dancing)
+                let isWardrobe = state.mode == .expanded && state.view == .wardrobe
+                let isFocusMain = state.focusId == state.mainPillId || state.focusId == nil
+                let showOutfit = isFocusMain || state.mode != .expanded || isWardrobe
+                engine.setOutfit(showOutfit ? state.resolvedOutfit : .none,
+                                 animated: state.view != .wardrobe)
 
-                engine.update(dt: dt)
+                #if !APPSTORE
+                if state.view == .listening {
+                    // Expanded listening view only (no longer used by voice, kept for the
+                    // view itself). Smoothed so the eyes do not follow every mic frame.
+                    let target = CGFloat(VoiceEngine.shared.micLevel)
+                    engine.listeningLevel += (target - engine.listeningLevel) * 0.12
+                    engine.listeningHasWords = !VoiceEngine.shared.commandTranscript.isEmpty
+                } else if state.voiceActive && state.mode == .compact {
+                    // Compact voice: feed mic level for the listening sub-state eye pulse.
+                    let target = CGFloat(VoiceEngine.shared.micLevel)
+                    engine.listeningLevel += (target - engine.listeningLevel) * 0.12
+                }
+                // Propagate voice sub-state every frame so BotEngine gets transitions promptly.
+                if state.voiceActive { engine.voiceSubState = state.voiceSubState }
+                else if engine.voiceSubState != .none { engine.voiceSubState = .none }
+                #endif
+
+                MochiFrameClock.advance(engine)
                 var ctx = context
                 engine.applyDance(&ctx, size: size)
-                engine.drawHandsBehind(context: ctx, size: size)
-                engine.draw(context: ctx, size: size)
+                // Rigid-roll: when Mochi wears an outfit (presence > 0.05) and is rolling,
+                // rotate the entire body+accessories context around the body center so the
+                // whole character genuinely turns. Particles/badge (drawHandsAndExtras) are
+                // drawn outside the rotated context and do not spin.
+                if engine.outfit != .none && engine.outfitPresence > 0.05 && abs(engine.roll) > 0.001 {
+                    let center = engine.bodyCenter(size: size)
+                    var rigidCtx = ctx
+                    rigidCtx.translateBy(x: center.x, y: center.y)
+                    rigidCtx.rotate(by: .radians(engine.roll))
+                    rigidCtx.translateBy(x: -center.x, y: -center.y)
+                    engine.drawHandsBehind(context: rigidCtx, size: size)
+                    engine.drawOutfitBehind(context: rigidCtx, size: size)
+                    engine.draw(context: rigidCtx, size: size)
+                    engine.drawOutfitFront(context: rigidCtx, size: size)
+                } else {
+                    engine.drawHandsBehind(context: ctx, size: size)
+                    engine.drawOutfitBehind(context: ctx, size: size)
+                    engine.draw(context: ctx, size: size)
+                    engine.drawOutfitFront(context: ctx, size: size)
+                }
                 engine.drawHandsAndExtras(context: ctx, size: size)
             }
         }
         .onChange(of: state.effectiveState) { _, newState in
             engine.setState(newState)
         }
-        .onChange(of: state.view) { _, newView in
+        #if !APPSTORE
+        .onChange(of: state.voiceActive) { _, on in
+            if on { engine.enterVoiceCompact() } else { engine.exitVoiceCompact() }
+        }
+        #endif
+        .onChange(of: state.view) { oldView, newView in
             // Morph up when upload view is active
             if state.mode == .expanded && newView == .upload {
                 engine.anim("morph", keys: [TweenKey(target: 1, duration: 550, ease: Ease.inOut)])
@@ -77,6 +138,13 @@ struct BotCanvasView: View {
                 // Any other view (not mid-gulp): morph back
                 engine.anim("morph", keys: [TweenKey(target: 0, duration: 550, ease: Ease.inOut)])
             }
+            #if !APPSTORE
+            if newView == .listening {
+                engine.enterListening()
+            } else if oldView == .listening {
+                engine.exitListening(hadCommand: !VoiceEngine.shared.commandTranscript.isEmpty)
+            }
+            #endif
         }
         .onChange(of: state.mode) { _, newMode in
             // Hard-reset morph when island collapses
@@ -116,34 +184,43 @@ struct BotCanvasView: View {
         }
         .onAppear {
             engine.setState(state.effectiveState, force: true)
+            let isWardrobe = state.mode == .expanded && state.view == .wardrobe
+            let isFocusMain = state.focusId == state.mainPillId || state.focusId == nil
+            let showOutfit = isFocusMain || state.mode != .expanded || isWardrobe
+            engine.setOutfit(showOutfit ? state.resolvedOutfit : .none, animated: false)
         }
     }
 
-    private func lookX(state: AppState, size: CGSize) -> CGFloat {
-        let screen = NSScreen.main ?? NSScreen.screens[0]
+    /// Where Mochi looks (the pointer), both axes at once: the island geometry and the
+    /// screen are looked up once per frame instead of twice each.
+    private func lookXY(state: AppState) -> (x: CGFloat, y: CGFloat) {
+        if let origin = lookOriginOverride {
+            return (tanh((state.mousePosition.x - origin.x) / 260),
+                    -tanh((state.mousePosition.y - origin.y) / 200))
+        }
         let (islandW, islandH) = islandSize(mode: state.mode, view: state.view,
                                              progress: state.uploadProgress,
                                              nw: state.notchWidth, nh: state.notchHeight)
-        let (botCx, _, _, _) = botPosition(mode: state.mode, view: state.view,
-                                            islandW: islandW, islandH: islandH,
-                                            uploadProgress: state.uploadProgress)
-        // Island is centered on screen; bot is at botCx within island coords
-        let botScreenX = screen.frame.midX - islandW / 2 + botCx
-        return tanh((state.mousePosition.x - botScreenX) / 260)
-    }
-
-    private func lookY(state: AppState, size: CGSize) -> CGFloat {
-        let (islandW, islandH) = islandSize(mode: state.mode, view: state.view,
-                                             progress: state.uploadProgress,
-                                             nw: state.notchWidth, nh: state.notchHeight)
+        let screen = IslandWindowController.islandScreen().frame
+        let desktopTop = IslandWindowController.desktopTop
+        // The pointer read now, not from the island poll (which slows down far from it).
+        let mouse = DesktopSpace.topDown(NSEvent.mouseLocation, desktopTop: desktopTop)
+        func botPoint(islandH: CGFloat) -> CGPoint {
+            let (botCx, botCy, _, _) = botPosition(mode: state.mode, view: state.view,
+                                                    islandW: islandW, islandH: islandH,
+                                                    uploadProgress: state.uploadProgress)
+            return DesktopSpace.topDown(CGPoint(x: screen.midX - islandW / 2 + botCx,
+                                                y: screen.maxY - botCy),
+                                        desktopTop: desktopTop)
+        }
+        let botX = botPoint(islandH: islandH)
+        // The chat view grows with the conversation: vertical look uses its real height.
         let actualH: CGFloat = (state.mode == .expanded && state.view == .prompt)
             ? min(300, 240 + CGFloat(state.chatHistory.count) * 40)
             : islandH
-        let (_, botCy, _, _) = botPosition(mode: state.mode, view: state.view,
-                                             islandW: islandW, islandH: actualH,
-                                             uploadProgress: state.uploadProgress)
-        // Island top = screen top → bot screen Y = botCy from island top
-        return -tanh((state.mousePosition.y - botCy) / 200)
+        let botY = actualH == islandH ? botX : botPoint(islandH: actualH)
+        return (tanh((mouse.x - botX.x) / 260),
+                -tanh((mouse.y - botY.y) / 200))
     }
 }
 
@@ -164,13 +241,17 @@ struct MiniBotCanvasView: View {
         }())
     }
 
+    @Environment(\.islandViewActive) private var viewActive
+
+
     var body: some View {
-        TimelineView(.animation) { timeline in
+        // Display refresh rate. Paused in island views that are not shown.
+        TimelineView(.animation(paused: !viewActive)) { timeline in
+            let frame = timeline.date   // see BotCanvasView: redraw on every tick
             Canvas { context, size in
-                let now = timeline.date.timeIntervalSinceReferenceDate
-                let dt = min(0.05, now - engine.lastTime)
+                _ = frame
                 engine.setDancing(isDancing)
-                engine.update(dt: dt)
+                MochiFrameClock.advance(engine)
                 var ctx = context
                 engine.applyDance(&ctx, size: size)
                 engine.draw(context: ctx, size: size)
@@ -178,6 +259,11 @@ struct MiniBotCanvasView: View {
         }
         .onChange(of: task.state) { _, newState in
             engine.setState(newState)
+        }
+        // The colour is set once, when the engine is made: a colour picked in
+        // Settings has to reach a mini Mochi that is already on screen.
+        .onChange(of: task.color) { _, newColor in
+            engine.bodyColor = cgColorFromHex(newColor)
         }
         .onAppear {
             engine.setState(task.state, force: true)
@@ -194,19 +280,36 @@ struct MiniBotCanvasView: View {
     }
 }
 
-// MARK: - CGColor from hex string
+// MARK: - Frame clock
 
-func cgColorFromHex(_ hex: String) -> CGColor? {
-    let h = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
-    guard let val = UInt64(h, radix: 16) else { return nil }
-    let r = CGFloat((val >> 16) & 0xFF) / 255
-    let g = CGFloat((val >> 8)  & 0xFF) / 255
-    let b = CGFloat( val        & 0xFF) / 255
-    return CGColor(red: r, green: g, blue: b, alpha: 1)
-}
+/// Mochi's engine has always moved one `update(dt: 0.05)` per display frame (its look,
+/// colour, springs and particles are tuned to that). Drawing slower than the display must
+/// not slow Mochi down: each drawn frame runs the steps of the display frames it skipped.
+@MainActor
+enum MochiFrameClock {
+    /// The island screen's refresh rate, looked up at most every 2 s.
+    private static var fpsCache: (value: Double, at: CFTimeInterval) = (60, -10)
+    static var displayFPS: Double {
+        let now = CACurrentMediaTime()
+        if now - fpsCache.at > 2 {
+            let fps = IslandWindowController.islandScreen().maximumFramesPerSecond
+            fpsCache = (Double(min(120, max(30, fps))), now)
+        }
+        return fpsCache.value
+    }
 
-extension CGColor {
-    static func from(_ hex: String) -> CGColor {
-        cgColorFromHex(hex) ?? CGColor(gray: 0.5, alpha: 1)
+    /// minimumInterval for a target rate, 10 % short: display frames come every 16.6 ms
+    /// with jitter, and an interval of exactly 1/60 s skipped every other one (30 fps on a
+    /// 60 Hz screen). 60 on a 60 Hz screen draws every frame; on ProMotion, one in two.
+    static func interval(fps: Double) -> TimeInterval { 0.9 / fps }
+
+    /// One engine step per drawn frame, exactly as before the frame clock (9 October): a
+    /// perfectly regular rhythm. The step-debt version measured the time between renders,
+    /// and its jitter made frames with 0 steps (Mochi froze) and frames with 2 or more
+    /// (Mochi jumped), several times a second: the stutter when the island opens and when
+    /// Mochi follows the pointer. Mochi draws at the display rate, so one step per frame
+    /// is one step per display frame, which is what his motion is tuned to.
+    static func advance(_ engine: BotEngine) {
+        engine.update(dt: 0.05)
     }
 }

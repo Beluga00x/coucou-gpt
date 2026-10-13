@@ -5,7 +5,11 @@ click **Connect ChatGPT**, complete the official OpenAI page in your browser, an
 wait for Connected (or click Check status). No API key is needed. The account
 must have Codex access and remaining usage allowance. This is the Codex service
 using ChatGPT account authentication, not a connection to ChatGPT web chat history.
-Anthropic and its separate API-key/model settings remain available.
+Anthropic and all upstream API/local providers remain available. The chat model
+picker also offers ChatGPT account; its model is chosen by Codex, not an API model
+list. Switching into or out of ChatGPT starts a new conversation. Switching among
+ordinary API/local providers retains upstream shared text history. ChatGPT account
+credentials are never offered to the Android phone chat.
 
 ## Implementation and safety
 
@@ -36,7 +40,7 @@ Anthropic and its separate API-key/model settings remain available.
 - Native ephemeral threads keep conversation context. Only successful turns are
   retained in Coucou memory; a failed request is removed from the UI and restored
   to the input box. After a server error, successful text history is supplied as
-  quoted context to a fresh thread. New chat (`+`), switching providers,
+  quoted context to a fresh thread. New chat (`+`), crossing the ChatGPT provider boundary,
   connecting another account, disconnecting, and app restart clear conversation.
 - RPC deadline: 30 seconds; whole chat: 180 seconds; login: 10 minutes (checked
   when status is polled). Child is killed on drop/error/timeout. Raw server errors,
@@ -46,18 +50,19 @@ Anthropic and its separate API-key/model settings remain available.
 
 ## Build and deployment
 
-From `D:/coucou/windows` with Rust/MSVC and Node installed:
+From the checkout's `windows/` directory with Rust/MSVC and Node installed:
 
 ```sh
 export PATH=/c/Users/osand/.cargo/bin:$PATH
 npm ci
 node scripts/prepare-codex.mjs
-cargo test -p coucou --lib
+cargo test --workspace --locked
+npm test
 npm run test:chatgpt-ui
 npm run pack
 ```
 
-The UI smoke test starts/stops its own Vite on 127.0.0.1:1421 and uses installed
+The UI smoke test starts/stops its own Vite on an OS-assigned 127.0.0.1 port and uses installed
 Microsoft Edge headless. Its Tauri IPC is explicitly mocked; it does not sign in.
 The Rust tests separately launch the real official native CLI in temporary,
 isolated profiles. `prepare-codex` also runs automatically during prebuild/predev.
@@ -72,14 +77,18 @@ No running installed executable was replaced as part of implementation.
 ## Verification and remaining user step
 
 Verified automatically:
-- 12 Rust library tests pass, including legacy settings migration, actual CLI
+- 416 Rust library tests and 30 hook tests pass (2 opt-in Android/relay interop
+  tests ignored), including legacy settings migration, actual CLI
   handshake, isolated signed-out status, read-only thread creation, official
   browser-OAuth URL generation/cancellation, logout read-back, RPC timeout,
   two local-fixture replies with full conversation history and **zero tools**,
   redaction of a synthetic 401 server error, and closed-process handling.
+- 400 frontend tests pass, including account provider selection, phone exclusion,
+  upstream provider switching/streaming, translations and upstream features.
 - Edge component smoke tests pass for provider selection, Connect IPC, status,
   disconnect, reply rendering, New chat reset, and failed-turn retry behavior.
-- TypeScript/Vite and Windows release/NSIS packaging succeed.
+- TypeScript/Vite and Windows release/NSIS/MSI packaging succeed.
+  See `UPSTREAM-MERGE.md` for merge decisions and final verification results.
 
 **Not verified:** successful account authentication and a live OpenAI model reply.
 No user login was performed and no credentials were requested. The user must

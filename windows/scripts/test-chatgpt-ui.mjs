@@ -2,20 +2,26 @@
 // Backend tests separately launch the real official Codex executable.
 import { chromium } from '@playwright/test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { createServer } from 'vite';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const server = spawn(process.execPath, [resolve(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', '1421'], { cwd: root, stdio: 'ignore' });
+// Let the OS choose an available loopback port: fixed low ports can be denied
+// on Windows even when no process is listening. Await startup so errors surface.
+const server = await createServer({ root, server: { host: '127.0.0.1', port: 0, strictPort: true } });
 let browser;
 try {
-  let ready = false;
-  for (let i = 0; i < 60; i++) {
-    try { ready = (await fetch('http://127.0.0.1:1421/settings.html')).ok; } catch {}
-    if (ready) break;
-    await new Promise(r => setTimeout(r, 100));
-  }
-  assert(ready, 'Vite test server did not become ready');
+  // Vite 6's server.listen() treats port 0 as its default port. Bind its
+  // public Node HTTP server directly so 0 really means OS-assigned.
+  await new Promise((resolve, reject) => {
+    server.httpServer.once('error', reject);
+    server.httpServer.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.httpServer.address();
+  assert(address && typeof address === 'object', 'Vite must bind a TCP listener');
+  const settingsUrl = `http://127.0.0.1:${address.port}/settings.html`;
+  assert((await fetch(settingsUrl)).ok, 'Vite settings page must be ready');
+  console.log(`PASS Vite startup on loopback port ${address.port}`);
   browser = await chromium.launch({ channel: 'msedge', headless: true });
   const page = await browser.newPage();
   await page.addInitScript(() => {
@@ -41,8 +47,12 @@ try {
       },
     };
   });
-  await page.goto('http://127.0.0.1:1421/settings.html');
+  await page.goto(settingsUrl);
   const section = page.locator('section').filter({ has: page.getByRole('heading', { name: 'Chat provider', exact: true }) });
+  assert.deepEqual(await section.locator('option').evaluateAll(options => options.map(o => o.value)),
+    ['anthropic', 'google', 'openai', 'openrouter', 'chatgpt', 'ollama', 'lmstudio', 'custom']);
+  await section.getByRole('combobox').selectOption('google');
+  assert(await page.evaluate(() => window.testCalls.some(c => c.cmd === 'save_settings' && c.args.settings.chatProvider === 'google')));
   await section.getByRole('combobox').selectOption('chatgpt');
   assert(await page.evaluate(() => window.testCalls.some(c => c.cmd === 'save_settings' && c.args.settings.chatProvider === 'chatgpt')));
   await section.getByRole('button', { name: 'Connect ChatGPT', exact: true }).click();
@@ -78,5 +88,5 @@ try {
   console.log('PASS rendered reply, New chat reset, failed-turn rollback and retry input');
 } finally {
   await browser?.close();
-  server.kill();
+  await server.close();
 }
